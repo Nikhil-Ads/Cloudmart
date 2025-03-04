@@ -1,58 +1,11 @@
-# Configure the AWS Provider
 provider "aws" {
-  region = "us-east-1"  # Change this to your desired region
-}
-
-# Generate a unique bucket name using random string
-resource "random_string" "bucket_suffix" {
-  length  = 8
-  special = false
-  upper   = false
-}
-
-# Create S3 bucket with unique name
-resource "aws_s3_bucket" "example" {
-  bucket = "my-unique-bucket-${random_string.bucket_suffix.result}"
-
-  tags = {
-    Environment = "Dev"
-    Created_by  = "Terraform"
-  }
-}
-
-# Enable versioning
-resource "aws_s3_bucket_versioning" "versioning" {
-  bucket = aws_s3_bucket.example.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-# Enable server-side encryption
-resource "aws_s3_bucket_server_side_encryption_configuration" "encryption" {
-  bucket = aws_s3_bucket.example.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
-
-# Block public access
-resource "aws_s3_bucket_public_access_block" "public_access" {
-  bucket = aws_s3_bucket.example.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+  region = "us-east-1" 
 }
 
 # Tables DynamoDB
 resource "aws_dynamodb_table" "cloudmart_products" {
-  billing_mode   = "PAY_PER_REQUEST"
   name           = "cloudmart-products"
+  billing_mode   = "PAY_PER_REQUEST"
   hash_key       = "id"
 
   attribute {
@@ -70,6 +23,9 @@ resource "aws_dynamodb_table" "cloudmart_orders" {
     name = "id"
     type = "S"
   }
+  
+  stream_enabled   = true
+  stream_view_type = "NEW_AND_OLD_IMAGES"
 }
 
 resource "aws_dynamodb_table" "cloudmart_tickets" {
@@ -113,6 +69,10 @@ resource "aws_iam_role_policy" "lambda_policy" {
         Effect = "Allow"
         Action = [
           "dynamodb:Scan",
+          "dynamodb:GetRecords",
+          "dynamodb:GetShardIterator",
+          "dynamodb:DescribeStream",
+          "dynamodb:ListStreams",
           "logs:CreateLogGroup",
           "logs:CreateLogStream",
           "logs:PutLogEvents"
@@ -120,6 +80,7 @@ resource "aws_iam_role_policy" "lambda_policy" {
         Resource = [
           aws_dynamodb_table.cloudmart_products.arn,
           aws_dynamodb_table.cloudmart_orders.arn,
+          "${aws_dynamodb_table.cloudmart_orders.arn}/stream/*",
           aws_dynamodb_table.cloudmart_tickets.arn,
           "arn:aws:logs:*:*:*"
         ]
@@ -155,4 +116,30 @@ resource "aws_lambda_permission" "allow_bedrock" {
 # Output the ARN of the Lambda function
 output "list_products_function_arn" {
   value = aws_lambda_function.list_products.arn
+}
+
+# Lambda function for DynamoDB to BigQuery
+resource "aws_lambda_function" "dynamodb_to_bigquery" {
+  filename         = "../challenge-day2/backend/src/lambda/addToBigQuery/dynamodb_to_bigquery.zip"
+  function_name    = "cloudmart-dynamodb-to-bigquery"
+  role             = aws_iam_role.lambda_role.arn
+  handler          = "index.handler"
+  runtime          = "nodejs20.x"
+  source_code_hash = filebase64sha256("../challenge-day2/backend/src/lambda/addToBigQuery/dynamodb_to_bigquery.zip")
+
+  environment {
+    variables = {
+      GOOGLE_CLOUD_PROJECT_ID        = "my-project-cloudmart"
+      BIGQUERY_DATASET_ID            = "cloudmart"
+      BIGQUERY_TABLE_ID              = "cloudmart-orders"
+      GOOGLE_APPLICATION_CREDENTIALS = "/var/task/google_credentials.json"
+    }
+  }
+}
+
+# Lambda event source mapping for DynamoDB stream
+resource "aws_lambda_event_source_mapping" "dynamodb_stream" {
+  event_source_arn  = aws_dynamodb_table.cloudmart_orders.stream_arn
+  function_name     = aws_lambda_function.dynamodb_to_bigquery.arn
+  starting_position = "LATEST"
 }
