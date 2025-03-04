@@ -12,3 +12,5 @@ eksctl delete cluster --name cloudmart --region us-east-1
 # Destroy resources created by terraform
 cd terraform/
 terraform destroy -auto-approve
+
+cd ../

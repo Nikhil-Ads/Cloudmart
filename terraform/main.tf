@@ -1,58 +1,27 @@
-# Configure the AWS Provider
-provider "aws" {
-  region = "us-east-1"  # Change this to your desired region
-}
-
-# Generate a unique bucket name using random string
-resource "random_string" "bucket_suffix" {
-  length  = 8
-  special = false
-  upper   = false
-}
-
-# Create S3 bucket with unique name
-resource "aws_s3_bucket" "example" {
-  bucket = "my-unique-bucket-${random_string.bucket_suffix.result}"
-
-  tags = {
-    Environment = "Dev"
-    Created_by  = "Terraform"
-  }
-}
-
-# Enable versioning
-resource "aws_s3_bucket_versioning" "versioning" {
-  bucket = aws_s3_bucket.example.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-# Enable server-side encryption
-resource "aws_s3_bucket_server_side_encryption_configuration" "encryption" {
-  bucket = aws_s3_bucket.example.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.9.0"
     }
   }
 }
 
-# Block public access
-resource "aws_s3_bucket_public_access_block" "public_access" {
-  bucket = aws_s3_bucket.example.id
 
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+provider "aws" {
+  region = "us-east-1"
 }
+
+provider "time" {}
 
 # Tables DynamoDB
 resource "aws_dynamodb_table" "cloudmart_products" {
-  billing_mode   = "PAY_PER_REQUEST"
   name           = "cloudmart-products"
+  billing_mode   = "PAY_PER_REQUEST"
   hash_key       = "id"
 
   attribute {
@@ -70,6 +39,9 @@ resource "aws_dynamodb_table" "cloudmart_orders" {
     name = "id"
     type = "S"
   }
+
+  stream_enabled   = true
+  stream_view_type = "NEW_AND_OLD_IMAGES"
 }
 
 resource "aws_dynamodb_table" "cloudmart_tickets" {
@@ -113,6 +85,10 @@ resource "aws_iam_role_policy" "lambda_policy" {
         Effect = "Allow"
         Action = [
           "dynamodb:Scan",
+          "dynamodb:GetRecords",
+          "dynamodb:GetShardIterator",
+          "dynamodb:DescribeStream",
+          "dynamodb:ListStreams",
           "logs:CreateLogGroup",
           "logs:CreateLogStream",
           "logs:PutLogEvents"
@@ -120,6 +96,7 @@ resource "aws_iam_role_policy" "lambda_policy" {
         Resource = [
           aws_dynamodb_table.cloudmart_products.arn,
           aws_dynamodb_table.cloudmart_orders.arn,
+          "${aws_dynamodb_table.cloudmart_orders.arn}/stream/*",
           aws_dynamodb_table.cloudmart_tickets.arn,
           "arn:aws:logs:*:*:*"
         ]
@@ -155,4 +132,151 @@ resource "aws_lambda_permission" "allow_bedrock" {
 # Output the ARN of the Lambda function
 output "list_products_function_arn" {
   value = aws_lambda_function.list_products.arn
+}
+
+# Lambda function for DynamoDB to BigQuery
+resource "aws_lambda_function" "dynamodb_to_bigquery" {
+  filename         = "../backend/src/lambda/addToBigQuery/dynamodb_to_bigquery.zip"
+  function_name    = "cloudmart-dynamodb-to-bigquery"
+  role             = aws_iam_role.lambda_role.arn
+  handler          = "index.handler"
+  runtime          = "nodejs20.x"
+  source_code_hash = filebase64sha256("../backend/src/lambda/addToBigQuery/dynamodb_to_bigquery.zip")
+
+  environment {
+    variables = {
+      GOOGLE_CLOUD_PROJECT_ID        = "my-project-cloudmart"
+      BIGQUERY_DATASET_ID            = "cloudmart"
+      BIGQUERY_TABLE_ID              = "cloudmart-orders"
+      GOOGLE_APPLICATION_CREDENTIALS = "/var/task/google_credentials.json"
+    }
+  }
+}
+
+# Lambda event source mapping for DynamoDB stream
+resource "aws_lambda_event_source_mapping" "dynamodb_stream" {
+  event_source_arn  = aws_dynamodb_table.cloudmart_orders.stream_arn
+  function_name     = aws_lambda_function.dynamodb_to_bigquery.arn
+  starting_position = "LATEST"
+}
+
+data "aws_caller_identity" "current" {}
+
+data "aws_partition" "current" {}
+
+data "aws_region" "current" {}
+
+data "aws_iam_policy_document" "bedrock_agent_trust" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      identifiers = ["bedrock.amazonaws.com"]
+      type        = "Service"
+    }
+    condition {
+      test     = "StringEquals"
+      values   = [data.aws_caller_identity.current.account_id]
+      variable = "aws:SourceAccount"
+    }
+    condition {
+      test     = "ArnLike"
+      values   = ["arn:${data.aws_partition.current.partition}:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:agent/*"]
+      variable = "AWS:SourceArn"
+    }
+  }
+}
+
+data "aws_iam_policy_document" "bedrock_model_invoke" {
+  statement {
+    actions = ["bedrock:InvokeModel"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:bedrock:${data.aws_region.current.name}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0",
+    ]
+  }
+}
+
+# Create IAM role for Bedrock Agent
+resource "aws_iam_role" "bedrock_agent_role" {
+  name = "bedrock-agent-role"
+  assume_role_policy = data.aws_iam_policy_document.bedrock_agent_trust.json
+}
+
+resource "aws_iam_role_policy" "bedrock_model_invoke_policy" {
+  policy = data.aws_iam_policy_document.bedrock_model_invoke.json
+  role   = aws_iam_role.bedrock_agent_role.name
+  name = "BedrockModelAccessPolicy"
+}
+
+
+# Create IAM policy to Invoke Lambda function
+resource "aws_iam_policy" "access_lambda_policy" {
+  name        = "LambdaAccessPolicy"
+  path        = "/"
+  description = "IAM policy for accessing Lambda"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement =  [
+        {
+            Effect = "Allow",
+            Action = "lambda:InvokeFunction",
+            Resource = "arn:aws:lambda:*:*:function:cloudmart-list-products"
+        },
+        {
+            Effect = "Allow",
+            Action = "bedrock:InvokeModel",
+            Resource = "arn:aws:bedrock:*::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+        }
+    ]
+  })
+}
+
+# Attach the Bedrock model access policy to the Bedrock Agent role
+resource "aws_iam_role_policy_attachment" "access_bedrock_policy_attachment" {
+  policy_arn = aws_iam_policy.access_lambda_policy.arn
+  role       = aws_iam_role.bedrock_agent_role.name
+}
+
+# Create AWS Bedrock Agent
+resource "aws_bedrockagent_agent" "cloudmart_agent" {
+  agent_name    = "cloudmart-product-recommendation-agent"
+  instruction   = file("${path.module}/../res/agent_instructions.txt")
+  description   = "AI agent to assist CloudMart customers"
+  agent_resource_role_arn = aws_iam_role.bedrock_agent_role.arn
+
+  foundation_model = "anthropic.claude-3-sonnet-20240229-v1:0"
+
+}
+
+resource "time_sleep" "wait_30_seconds" {
+  create_duration = "30s"
+}
+
+# Associate the Lambda function with the Bedrock Agent
+resource "aws_bedrockagent_agent_action_group" "cloudmart_action_group" {
+  agent_id           = aws_bedrockagent_agent.cloudmart_agent.id
+  agent_version      = "DRAFT"
+  action_group_name  = "Get-Product-Recommendations"
+  description        = "Action group for CloudMart operations"
+  skip_resource_in_use_check = true
+
+  action_group_executor {
+    lambda = aws_lambda_function.list_products.arn
+  }
+
+  action_group_state = "ENABLED"
+
+  depends_on = [time_sleep.wait_30_seconds]
+
+  api_schema {
+    payload = file("${path.module}/../res/product_schema.json")
+  }
+  prepare_agent = true
+}
+
+# Create an alias for the Bedrock Agent
+resource "aws_bedrockagent_agent_alias" "cloudmart_agent_alias" {
+  agent_id    = aws_bedrockagent_agent.cloudmart_agent.id
+  depends_on = [aws_bedrockagent_agent_action_group.cloudmart_action_group]
+  agent_alias_name = "cloudmart-prod"
 }
